@@ -6,9 +6,9 @@
  * 实现原则：能复用真实引擎的就复用（医疗/任务/战绩/招募集合），
  * 否则保持轻量占位（拍卖/赌战等需后端支持的项）。
  */
-import { useEffect, useMemo, useRef, useState, Fragment } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, Fragment } from 'react';
 import { ResetSaveDialog } from '../components/ResetSaveDialog';
-import { attrLabel, tierColor, tierNameFromTier, ALL_ATTR_KEYS, rollTraitCandidates, type SurvivorTrait } from '@shared/engine/survival/chargen';
+import { attrLabel, tierColor, tierNameFromTier, ALL_ATTR_KEYS, rollTraitCandidates, type SurvivorTrait, type SurvivorProfile, generateSurvivor } from '@shared/engine/survival/chargen';
 import { affixColor, affixLabel } from '@shared/engine/survival/affixes';
 import type { AffixTierKey } from '@shared/engine/survival/affixes';
 import type { Attributes } from '@shared/types/cultivator';
@@ -16,8 +16,17 @@ import type { SurvivalGameState, SortieLog } from '@shared/engine/survival/state
 import {
   prepareArenaDuel,
   arenaStep,
+  restoreArenaDuelSession,
   type ArenaDuelHandle,
 } from '@shared/engine/survival/arenaDuel';
+import type { WagerState, WagerLogLine, WagerBetSide } from '@shared/engine/survival/wager';
+import {
+  AUCTION_COUNT,
+  AUCTION_INSTANT_REFRESH_COST,
+  rollNewAuction,
+  buyAuctionItem,
+  type AuctionItem,
+} from '@shared/engine/survival/auction';
 import type { UnitStateSnapshot } from '@shared/engine/battle-v5/systems/state/types';
 import type { CombatSequenceV3 } from '@shared/engine/battle-v5/v3/types';
 import {
@@ -86,8 +95,7 @@ import {
   GEAR_SLOT_LABEL,
   type GearSlot,
 } from '@shared/engine/survival/economy';
-import { INJURY_LABEL, regenPerMinute, timeToFullSeconds } from '@shared/engine/survival/recovery';
-import { generateSurvivor } from '@shared/engine/survival/chargen';
+import { INJURY_LABEL, regenPerMinute, timeToFullSeconds, freshStatus } from '@shared/engine/survival/recovery';
 // v1.1.0：漫游 = 模拟一次完整副本（同源结算）
 import { simulateWanderSortie, type WanderReport } from '@shared/engine/survival/wander';
 import { createRun, search, rollRescue, fight, extract, mulberry32, sumValue } from '@shared/engine/extraction';
@@ -872,11 +880,10 @@ export const ViewWandering: React.FC<ViewProps> = ({ state, mutate, rng }) => {
           disabled={running || !active || ap.current < 6}
           className="rounded bg-emerald-600 px-4 py-2 text-white hover:bg-emerald-700 disabled:opacity-40"
         >
-          派出一支小队
+          派{active ? active.name : '未指定'}出击
         </button>
         <span className="text-xs text-zinc-400">
-          消耗：危1 6 点 … 危7 12 点（区域随机，派出瞬间扣除）· 出击者：
-          {active ? active.name : '未指定'}
+          消耗：危1 6 点 … 危7 12 点（区域随机，派出瞬间扣除）
         </span>
       </div>
 
@@ -1540,7 +1547,7 @@ export const ViewReforge: React.FC<ViewProps> = ({ state, mutate, rng }) => {
                   <div className="mt-1 text-xs text-zinc-400">
                     {gear.affixes.length ? gear.affixes.join(' / ') : '无额外词缀'}
                   </div>
-                  <div className="mt-1 text-xs text-zinc-500">估值 ⛁{gear.value}</div>
+                  <div className="mt-1 text-xs text-zinc-500">估值 ⛁{gearSellPrice(gear)}</div>
                 </>
               ) : (
                 <div className="mt-2 text-xs text-zinc-500">当前出击者在此槽位没有装备。</div>
@@ -1611,17 +1618,180 @@ export const ViewPremiumShop: React.FC<ViewProps> = ({ state, mutate }) => {
   );
 };
 
-// ===== 14. 拍卖行（占位） =====
-export const ViewAuction: React.FC = () => (
-  <Section title="拍卖行" subtitle="玩家间物品竞拍（需服务端，本地未启用）">
-    <Card>
-      <div className="text-sm text-zinc-300">
-        拍卖行依赖实时出价与历史成交，本地单用户存档无法承载。功能已锁定以等待后端支持。
+// ===== 14. 拍卖行（v1.1.9：本地单用户拍卖，随机刷装备 + 废土币购买） =====
+export const ViewAuction: React.FC<ViewProps> = ({ state, mutate, rng }) => {
+  const [now, setNow] = useState(() => Date.now());
+  const [toast, setToast] = useState<string | null>(null);
+  const stateRef = useRef(state);
+  stateRef.current = state;
+
+  // 倒计时：每秒刷新一次 now
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+
+  const doRefresh = useCallback(
+    (paid: boolean) => {
+      const cost = paid ? AUCTION_INSTANT_REFRESH_COST : 0;
+      if (paid && stateRef.current.coins < cost) {
+        setToast(`⚠️ 废土币不足，立即刷新需要 ${cost} 币（当前 ${stateRef.current.coins}）。`);
+        return;
+      }
+      mutate((s) => rollNewAuction(s, rng, Date.now(), cost));
+      setToast(paid ? `✅ 花费 ${cost} 废土币刷新了拍卖行。` : '✅ 拍卖行已刷新。');
+    },
+    [mutate, rng],
+  );
+
+  // 挂载时若无拍卖数据或已过期则自动刷新；倒计时归零也会自动刷新
+  useEffect(() => {
+    const a = stateRef.current.auction;
+    if (!a || a.refreshAt <= now) doRefresh(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [now]);
+
+  const auc = state.auction;
+  const remainingMs = Math.max(0, (auc?.refreshAt ?? 0) - now);
+  const mm = Math.floor(remainingMs / 60000);
+  const ss = Math.floor((remainingMs % 60000) / 1000);
+  const countdown = `${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')}`;
+
+  const onBuy = (item: AuctionItem) => {
+    if (item.sold) return;
+    if (state.coins < item.price) {
+      setToast(`⚠️ 废土币不足，需要 ${item.price} 币（当前 ${state.coins}）。`);
+      return;
+    }
+    mutate((s) => buyAuctionItem(s, item.id));
+    setToast(`✅ 已购入 ${item.gear.name}（${item.gear.rarityName ?? item.gear.rarity}）。`);
+  };
+
+  const canInstant = state.coins >= AUCTION_INSTANT_REFRESH_COST;
+
+  return (
+    <Section
+      title="拍卖行"
+      subtitle={
+        <span>
+          废土游商随机上架 {AUCTION_COUNT} 件装备，每 <b className="text-amber-300">30 分钟</b> 自动刷新；
+          也可花 <b className="text-amber-300">{AUCTION_INSTANT_REFRESH_COST} 废土币</b> 立即再刷一轮（不影响自动倒计时）。
+        </span>
+      }
+      right={
+        <div className="flex items-center gap-2">
+          <div className="text-right">
+            <div className="font-mono text-xs text-zinc-400">下次刷新</div>
+            <div className="font-mono text-lg font-semibold text-amber-300">{countdown}</div>
+          </div>
+          <button
+            onClick={() => doRefresh(true)}
+            disabled={!canInstant}
+            title={canInstant ? '立即再刷一轮' : `需要 ${AUCTION_INSTANT_REFRESH_COST} 废土币`}
+            className="rounded bg-amber-600 px-3 py-2 text-xs font-medium text-white transition hover:bg-amber-500 disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            立即刷新<br />({AUCTION_INSTANT_REFRESH_COST} 币)
+          </button>
+        </div>
+      }
+    >
+      <div className="mb-3 flex items-center justify-between text-xs text-zinc-400">
+        <span>当前废土币：<span className="font-mono text-amber-300">{state.coins}</span></span>
+        <span>已上架 {auc?.items.length ?? 0} 件 · 余 {auc?.items.filter((x) => !x.sold).length ?? 0} 件可购</span>
       </div>
-      <div className="mt-3 text-xs text-zinc-500">建议路径：列表/出价/成交/历史</div>
-    </Card>
-  </Section>
-);
+
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+        {(auc?.items ?? []).map((item) => {
+          const g = item.gear;
+          const color = g.tierColor ?? '#e4e4e7';
+          const mods = Object.entries(g.modifiers ?? {}).filter(([, v]) => (v ?? 0) !== 0);
+          const combat = g.combat
+            ? [
+                g.combat.hpBonus ? `生命 +${g.combat.hpBonus}` : '',
+                g.combat.critBonus ? `暴击 +${Math.round(g.combat.critBonus * 100)}%` : '',
+                g.combat.lootLuck ? `搜刮 +${Math.round(g.combat.lootLuck * 100)}%` : '',
+                g.combat.xpBonus ? `经验 +${Math.round(g.combat.xpBonus * 100)}%` : '',
+                g.combat.coinBonus ? `金币 +${Math.round(g.combat.coinBonus * 100)}%` : '',
+              ].filter(Boolean)
+            : [];
+          const affordable = !item.sold && state.coins >= item.price;
+          return (
+            <Card
+              key={item.id}
+              className="flex flex-col"
+              style={{ borderColor: item.sold ? '#3f3f46' : color }}
+            >
+              <div className="flex items-start justify-between gap-2">
+                <div className="min-w-0">
+                  <div className="truncate text-sm font-semibold" style={{ color }}>
+                    {g.name}
+                  </div>
+                  <div className="text-[11px] text-zinc-400">
+                    {GEAR_SLOT_LABEL[g.slot]} · {g.rarityName ?? g.rarity}
+                  </div>
+                </div>
+                <span
+                  className="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium"
+                  style={{ background: `${color}22`, color }}
+                >
+                  {g.rarityName ?? g.rarity}
+                </span>
+              </div>
+
+              <div className="mt-2 flex flex-wrap gap-x-2 gap-y-1 text-[11px]">
+                {(() => {
+                  const chips: { text: string; tone: 'attr' | 'combat' }[] = [];
+                  for (const [k, v] of Object.entries(g.modifiers ?? {})) {
+                    if ((v ?? 0) !== 0) {
+                      chips.push({ text: `${attrLabel(k as keyof Attributes)}+${v}`, tone: 'attr' });
+                    }
+                  }
+                  const c = g.combat;
+                  if (c) {
+                    if (c.hpBonus) chips.push({ text: `生命+${c.hpBonus}`, tone: 'combat' });
+                    if (c.critBonus) chips.push({ text: `暴击+${Math.round(c.critBonus * 100)}%`, tone: 'combat' });
+                    if (c.lootLuck) chips.push({ text: `搜刮+${Math.round((c.lootLuck ?? 0) * 100)}%`, tone: 'combat' });
+                    if (c.xpBonus) chips.push({ text: `经验+${Math.round((c.xpBonus ?? 0) * 100)}%`, tone: 'combat' });
+                    if (c.coinBonus) chips.push({ text: `金币+${Math.round((c.coinBonus ?? 0) * 100)}%`, tone: 'combat' });
+                  }
+                  return chips.map((chip, i) => (
+                    <span
+                      key={i}
+                      className="rounded px-1.5 py-0.5 text-[11px]"
+                      style={{
+                        background: chip.tone === 'attr' ? 'rgba(63,63,70,0.5)' : `${color}22`,
+                        color: chip.tone === 'attr' ? '#d4d4d8' : color,
+                      }}
+                    >
+                      {chip.text}
+                    </span>
+                  ));
+                })()}
+              </div>
+
+              <div className="mt-auto flex items-center justify-between pt-3">
+                <span className="font-mono text-sm text-amber-300">⛁ {item.price}</span>
+                {item.sold ? (
+                  <span className="rounded bg-zinc-800 px-3 py-1 text-xs text-zinc-500">已售出</span>
+                ) : (
+                  <button
+                    onClick={() => onBuy(item)}
+                    disabled={!affordable}
+                    className="rounded bg-stone-600 px-3 py-1 text-xs font-medium text-white transition hover:bg-stone-500 disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    {state.coins < item.price ? '币不足' : '购买'}
+                  </button>
+                )}
+              </div>
+            </Card>
+          );
+        })}
+      </div>
+
+      {toast && <div className="mt-3 text-xs text-emerald-300">{toast}</div>}
+    </Section>
+  );
+};
 
 // ===== 15. 英雄榜 =====
 const LEADERBOARD_MEDAL = ['🥇', '🥈', '🥉'];
@@ -1663,27 +1833,515 @@ export const ViewLeaderboard: React.FC<ViewProps> = ({ state }) => {
   );
 };
 
-// ===== 16. 末世赌局（占位） =====
-export const ViewWager: React.FC = () => (
-  <Section title="末世赌局" subtitle="以废土币押注其他幸存者的 PvP 战斗结果">
-    <Card>
-      <div className="text-sm text-zinc-300">需 PvP 匹配与见证，本地未启用。</div>
+// ===== 16. 末世赌局（v1.1.9：本地 1v1 押注对决） =====
+const WAGER_BET = 500;
+const EMPTY_TIMELINE: import('@shared/engine/battle-v5/v3/types').BattleStateTimelineV3 = {
+  frames: [],
+  unitIds: [],
+  unitNames: {},
+};
+
+function generateWagerFighters(rng: RNG): { a: SurvivorProfile; b: SurvivorProfile } {
+  // 随机选 1~4 段，让两名选手同段生成，战力天然相近
+  const tier = Math.floor(rng() * 4) + 1;
+  const a = generateSurvivor(rng, { genTier: tier });
+  let b = generateSurvivor(rng, { genTier: tier });
+  // 若战力差过大，最多重抽 20 次
+  for (let i = 0; i < 20 && Math.abs(a.power - b.power) > 12; i++) {
+    b = generateSurvivor(rng, { genTier: tier });
+  }
+  return { a, b };
+}
+
+const WAGER_ATTRS: { key: keyof Attributes; label: string }[] = [
+  { key: 'vitality', label: '体质' },
+  { key: 'strength', label: '力量' },
+  { key: 'spirit', label: '感知' },
+  { key: 'endurance', label: '耐力' },
+  { key: 'speed', label: '敏捷' },
+  { key: 'willpower', label: '意志' },
+];
+
+function WagerHpBar({ current, max }: { current: number; max: number }) {
+  const pct = Math.max(0, Math.min(100, max > 0 ? (current / max) * 100 : 0));
+  const color = pct > 50 ? 'bg-emerald-500' : pct > 20 ? 'bg-amber-500' : 'bg-rose-500';
+  return (
+    <div className="h-3 w-full overflow-hidden rounded bg-zinc-800">
+      <div className={`h-full ${color} transition-all duration-300`} style={{ width: `${pct}%` }} />
+    </div>
+  );
+}
+
+function WagerFighterPanel({
+  fighter,
+  betSide,
+  onBet,
+  disabled,
+  highlight,
+}: {
+  fighter: SurvivorProfile;
+  betSide: 'a' | 'b';
+  onBet: (side: 'a' | 'b') => void;
+  disabled: boolean;
+  highlight?: boolean;
+}) {
+  const status = freshStatus(fighter, Date.now());
+  const maxHp = status.maxHp;
+  return (
+    <Card className={`flex-1 !p-3 ${highlight ? 'ring-2 ring-emerald-500/60' : ''}`}>
+      <div className="mb-2 flex items-center justify-between">
+        <div>
+          <div className="text-sm font-semibold text-zinc-100">{fighter.name}</div>
+          <div className="text-[11px]" style={{ color: tierColor(fighter.tier) }}>
+            {fighter.tierName} · 战力 {fighter.power}
+          </div>
+        </div>
+        <span className="rounded bg-zinc-800 px-1.5 py-0.5 text-[10px] text-zinc-300">满血</span>
+      </div>
+      <div className="mb-1 flex items-center justify-between text-xs">
+        <span className="text-zinc-400">生命</span>
+        <span className="tabular-nums text-zinc-200">
+          {maxHp} / {maxHp}
+        </span>
+      </div>
+      <WagerHpBar current={maxHp} max={maxHp} />
+      <div className="mt-3">
+        <div className="mb-1 text-[11px] font-medium tracking-wide text-zinc-500">六维</div>
+        <div className="grid grid-cols-3 gap-x-2 gap-y-1 text-[11px]">
+          {WAGER_ATTRS.map(({ key, label }) => (
+            <div key={label} className="flex items-center justify-between">
+              <span className="text-zinc-500">{label}</span>
+              <span className="tabular-nums text-zinc-300">
+                {Math.round((fighter.attributes[key] as number) ?? 0)}
+              </span>
+            </div>
+          ))}
+        </div>
+      </div>
+      <div className="mt-3">
+        <div className="mb-1 text-[11px] font-medium tracking-wide text-zinc-500">天赋</div>
+        <div className="flex flex-wrap gap-1">
+          {fighter.traits.length === 0 ? (
+            <span className="text-[10px] text-zinc-500">无</span>
+          ) : (
+            fighter.traits.map((t, i) => (
+              <span
+                key={`${t.id}-${i}`}
+                className="rounded bg-zinc-800 px-1.5 py-0.5 text-[10px] text-zinc-300"
+                title={t.description}
+              >
+                {t.name}
+              </span>
+            ))
+          )}
+        </div>
+      </div>
+      <button
+        onClick={() => onBet(betSide)}
+        disabled={disabled}
+        className="mt-3 w-full rounded bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-40"
+      >
+        押 {fighter.name} 胜（-{WAGER_BET}）
+      </button>
     </Card>
-  </Section>
-);
+  );
+}
+
+export const ViewWager: React.FC<ViewProps> = ({ state, mutate, rng }) => {
+  const initialWager = state.wager;
+  const [fighters, setFighters] = useState<{ a: SurvivorProfile; b: SurvivorProfile } | null>(
+    initialWager?.fighters ?? null,
+  );
+  const [bet, setBet] = useState<WagerBetSide | null>(initialWager?.bet ?? null);
+  const [duel, setDuel] = useState<ArenaDuelHandle | null>(null);
+  const duelRef = useRef<ArenaDuelHandle | null>(null);
+  const [started, setStarted] = useState<boolean>(initialWager?.started ?? false);
+  const [round, setRound] = useState(initialWager?.round ?? 0);
+  const [snaps, setSnaps] = useState<{ a: UnitStateSnapshot | null; b: UnitStateSnapshot | null }>(
+    initialWager?.snaps ?? { a: null, b: null },
+  );
+  const [log, setLog] = useState<WagerLogLine[]>(initialWager?.log ?? []);
+  const [ended, setEnded] = useState<boolean>(initialWager?.ended ?? false);
+  const [winnerId, setWinnerId] = useState<string | null>(initialWager?.winnerId ?? null);
+  const [settled, setSettled] = useState<boolean>(initialWager?.settled ?? false);
+  const [resultMsg, setResultMsg] = useState<string | null>(initialWager?.resultMsg ?? null);
+  const logEndRef = useRef<HTMLDivElement | null>(null);
+
+  const canAfford = state.coins >= WAGER_BET;
+
+  const generateNewPair = useCallback(() => {
+    const pair = generateWagerFighters(rng);
+    setFighters(pair);
+    setBet(null);
+    setDuel(null);
+    duelRef.current = null;
+    setStarted(false);
+    setRound(0);
+    setSnaps({ a: null, b: null });
+    setLog([]);
+    setEnded(false);
+    setWinnerId(null);
+    setSettled(false);
+    setResultMsg(null);
+    mutate((s) => {
+      const ws: WagerState = {
+        version: 1,
+        fighters: pair,
+        bet: null,
+        started: false,
+        battleId: '',
+        playerId: pair.a.id,
+        opponentId: pair.b.id,
+        save: null,
+        initialTimeline: EMPTY_TIMELINE,
+        round: 0,
+        ended: false,
+        winnerId: null,
+        settled: false,
+        resultMsg: null,
+        log: [],
+        snaps: { a: null, b: null },
+      };
+      return { ...s, wager: ws };
+    });
+  }, [rng, mutate]);
+
+  // 首次挂载：从存档恢复赌局（含未完成的 mid-duel），否则生成新一组
+  useEffect(() => {
+    if (initialWager?.started && initialWager.save) {
+      const session = restoreArenaDuelSession(
+        initialWager.save,
+        initialWager.playerId,
+        initialWager.opponentId,
+        initialWager.initialTimeline,
+      );
+      if (session) {
+        const handle = { session, idA: initialWager.fighters.a.id, idB: initialWager.fighters.b.id };
+        duelRef.current = handle;
+        setDuel(handle);
+      }
+    } else if (!initialWager) {
+      generateNewPair();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    logEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+  }, [log]);
+
+  const placeBet = (side: WagerBetSide) => {
+    if (!fighters || !canAfford || started) return;
+    setBet(side);
+    mutate((s) => {
+      const base = s.wager;
+      const ws: WagerState = {
+        version: 1,
+        fighters,
+        bet: side,
+        started: base?.started ?? false,
+        battleId: base?.battleId ?? '',
+        playerId: fighters.a.id,
+        opponentId: fighters.b.id,
+        save: base?.save ?? null,
+        initialTimeline: base?.initialTimeline ?? EMPTY_TIMELINE,
+        round: base?.round ?? 0,
+        ended: base?.ended ?? false,
+        winnerId: base?.winnerId ?? null,
+        settled: base?.settled ?? false,
+        resultMsg: base?.resultMsg ?? null,
+        log: base?.log ?? [],
+        snaps: base?.snaps ?? { a: null, b: null },
+      };
+      return {
+        ...s,
+        coins: s.coins - WAGER_BET,
+        wager: ws,
+        log: [
+          `【赌局】押注 ${side === 'a' ? fighters.a.name : fighters.b.name}，投入 ${WAGER_BET} 废土币。`,
+          ...s.log,
+        ].slice(0, 50),
+      };
+    });
+  };
+
+  const startDuel = () => {
+    if (!fighters || !bet) return;
+    const syntheticState: SurvivalGameState = {
+      ...state,
+      survivors: [fighters.a, fighters.b],
+      survivorStatus: {
+        [fighters.a.id]: freshStatus(fighters.a, Date.now()),
+        [fighters.b.id]: freshStatus(fighters.b, Date.now()),
+      },
+      equipped: {},
+    };
+    const handle = prepareArenaDuel(syntheticState, fighters.a.id, fighters.b.id);
+    if (!handle) return;
+    duelRef.current = handle;
+    setDuel(handle);
+    setStarted(true);
+    setRound(0);
+    setEnded(false);
+    setWinnerId(null);
+    const frame = handle.session.initialTimeline.frames[handle.session.initialTimeline.frames.length - 1];
+    const nextSnaps = {
+      a: frame?.units[handle.session.playerId] ?? null,
+      b: frame?.units[handle.session.opponentId] ?? null,
+    };
+    setSnaps(nextSnaps);
+    const nextLog: WagerLogLine[] = [
+      { round: 0, text: `⚔ 末世赌局开始：${fighters.a.name} vs ${fighters.b.name}`, tone: 'header' },
+    ];
+    setLog(nextLog);
+    mutate((s) => ({
+      ...s,
+      wager: {
+        version: 1,
+        fighters,
+        bet,
+        started: true,
+        battleId: handle.session.battleId,
+        playerId: handle.session.playerId,
+        opponentId: handle.session.opponentId,
+        save: handle.session.save,
+        initialTimeline: handle.session.initialTimeline,
+        round: 0,
+        ended: false,
+        winnerId: null,
+        settled: false,
+        resultMsg: null,
+        log: nextLog,
+        snaps: nextSnaps,
+      },
+    }));
+  };
+
+  const nextRound = () => {
+    const handle = duelRef.current;
+    if (!handle || ended) return;
+    const res = arenaStep(handle.session);
+    handle.session.save = res.save;
+    const r = res.round;
+    setRound(r);
+    const frame = res.stateTimeline.frames[res.stateTimeline.frames.length - 1];
+    const pa = frame?.units[handle.session.playerId] ?? null;
+    const pb = frame?.units[handle.session.opponentId] ?? null;
+    setSnaps({ a: pa, b: pb });
+    if (!fighters) return;
+    const lines = arenaLogFromSequences(res.sequences).map((l) => ({ round: r, ...l }));
+    const nextLog: WagerLogLine[] = [...log, { round: r, text: `—— 第 ${r} 回合 ——`, tone: 'neutral' }, ...lines];
+    setLog(nextLog);
+    let nextEnded: boolean = ended;
+    let nextWinnerId = winnerId;
+    if (res.outcome.battleEnded) {
+      nextEnded = true;
+      nextWinnerId = pa?.alive ? handle.session.playerId : pb?.alive ? handle.session.opponentId : null;
+      setEnded(true);
+      setWinnerId(nextWinnerId);
+    }
+    mutate((s) => ({
+      ...s,
+      wager: {
+        version: 1,
+        fighters,
+        bet,
+        started: true,
+        battleId: handle.session.battleId,
+        playerId: handle.session.playerId,
+        opponentId: handle.session.opponentId,
+        save: handle.session.save,
+        initialTimeline: handle.session.initialTimeline,
+        round: r,
+        ended: nextEnded,
+        winnerId: nextWinnerId,
+        settled: false,
+        resultMsg: null,
+        log: nextLog,
+        snaps: { a: pa, b: pb },
+      },
+    }));
+  };
+
+  useEffect(() => {
+    if (!ended || !winnerId || settled || !fighters) return;
+    const won = winnerId === (bet === 'a' ? fighters.a.id : fighters.b.id);
+    setSettled(true);
+    const msg = won
+      ? `🎉 押中胜者！赢得 ${WAGER_BET * 2} 废土币（净赚 ${WAGER_BET}）。`
+      : `💸 押注落空，损失 ${WAGER_BET} 废土币。`;
+    setResultMsg(msg);
+    mutate((s) => ({
+      ...s,
+      coins: s.coins + (won ? WAGER_BET * 2 : 0),
+      wager: s.wager
+        ? {
+            ...s.wager,
+            settled: true,
+            resultMsg: msg,
+          }
+        : undefined,
+      log: [
+        `【赌局】${won ? '押中胜者，赢得' : '押注落空，损失'} ${won ? WAGER_BET * 2 : WAGER_BET} 废土币。`,
+        ...s.log,
+      ].slice(0, 50),
+    }));
+  }, [ended, winnerId, settled, bet, fighters, mutate]);
+
+  if (!fighters) {
+    return (
+      <Section title="末世赌局" subtitle="以废土币押注两位临时幸存者的 1v1 对决结果">
+        <Card>
+          <div className="text-sm text-zinc-300">正在生成对战选手…</div>
+        </Card>
+      </Section>
+    );
+  }
+
+  return (
+    <Section title="末世赌局" subtitle="以废土币押注两位临时幸存者的 1v1 对决结果">
+      <Card>
+        <p className="mb-2 text-xs text-zinc-400">
+          系统会随机生成两名<strong className="text-zinc-200">战力相近</strong>的临时幸存者，双方均无装备、以满血开局。
+          你可以先查看面板与天赋，再押注其中一方。下注<strong className="text-zinc-200"> {WAGER_BET} 废土币</strong>，
+          猜中胜者即返还 <strong className="text-zinc-200">{WAGER_BET * 2}</strong>（净赚 {WAGER_BET}），猜错则本金归庄家。
+        </p>
+        <p className="text-xs text-zinc-500">对决为本地模拟，不改变战团成员与装备。</p>
+      </Card>
+
+      {!started && (
+        <>
+          <div className="flex gap-3">
+            <WagerFighterPanel
+              fighter={fighters.a}
+              betSide="a"
+              onBet={placeBet}
+              disabled={!canAfford || started}
+              highlight={bet === 'a'}
+            />
+            <WagerFighterPanel
+              fighter={fighters.b}
+              betSide="b"
+              onBet={placeBet}
+              disabled={!canAfford || started}
+              highlight={bet === 'b'}
+            />
+          </div>
+          {bet && (
+            <div className="rounded border border-emerald-900/60 bg-emerald-950/20 px-3 py-2 text-center text-sm text-emerald-200">
+              已押注 {bet === 'a' ? fighters.a.name : fighters.b.name} · 投入 {WAGER_BET} 废土币
+            </div>
+          )}
+          <div className="flex gap-3">
+            <button
+              onClick={startDuel}
+              disabled={!bet || !canAfford}
+              className="flex-1 rounded bg-rose-700 px-4 py-2 text-sm font-semibold text-white hover:bg-rose-600 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              开始切磋
+            </button>
+            <button
+              onClick={generateNewPair}
+              disabled={!!bet || started}
+              className="rounded bg-zinc-700 px-4 py-2 text-sm font-medium text-white hover:bg-zinc-600 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              换一组
+            </button>
+          </div>
+        </>
+      )}
+
+      {started && (
+        <>
+          <div className="flex items-center justify-between">
+            <h3 className="text-sm font-semibold text-zinc-200">
+              第 {round} 回合{ended ? '（已结束）' : ''}
+            </h3>
+            {ended && winnerId && (
+              <Pill tone="green">
+                🏆 {winnerId === fighters.a.id ? fighters.a.name : fighters.b.name} 获胜
+              </Pill>
+            )}
+          </div>
+
+          <div className="flex gap-3">
+            <CombatantCard
+              snap={snaps.a}
+              name={fighters.a.name}
+              highlight={ended && winnerId === fighters.a.id}
+            />
+            <CombatantCard
+              snap={snaps.b}
+              name={fighters.b.name}
+              highlight={ended && winnerId === fighters.b.id}
+            />
+          </div>
+
+          <div className="flex gap-3">
+            <button
+              onClick={nextRound}
+              disabled={ended}
+              className="flex-1 rounded bg-rose-700 px-4 py-2 text-sm font-semibold text-white hover:bg-rose-600 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {ended ? '对决已结束' : '⚔ 下一回合'}
+            </button>
+            {ended && (
+              <button
+                onClick={generateNewPair}
+                className="rounded bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700"
+              >
+                再来一局
+              </button>
+            )}
+          </div>
+
+          {resultMsg && (
+            <div
+              className={`rounded px-3 py-2 text-center text-sm ${
+                resultMsg.includes('🎉')
+                  ? 'bg-emerald-950/30 text-emerald-300'
+                  : 'bg-rose-950/30 text-rose-300'
+              }`}
+            >
+              {resultMsg}
+            </div>
+          )}
+
+          <Card className="!p-0">
+            <div className="max-h-64 overflow-y-auto p-3 text-xs leading-relaxed">
+              {log.map((l, i) => {
+                const cls =
+                  l.tone === 'header'
+                    ? 'font-semibold text-emerald-300'
+                    : l.tone === 'damage'
+                      ? 'text-rose-300'
+                      : l.tone === 'dodge'
+                        ? 'text-sky-300'
+                        : l.tone === 'death'
+                          ? 'font-semibold text-rose-400'
+                          : l.tone === 'heal'
+                            ? 'text-emerald-400'
+                            : 'text-zinc-400';
+                return (
+                  <div key={i} className={cls}>
+                    {l.text}
+                  </div>
+                );
+              })}
+              <div ref={logEndRef} />
+            </div>
+          </Card>
+        </>
+      )}
+    </Section>
+  );
+};
 
 // ===== 17. 擂台切磋（本地 1v1 模拟对决） =====
 
-type ArenaLogTone = 'header' | 'damage' | 'dodge' | 'death' | 'heal' | 'neutral';
-interface ArenaLogLine {
-  round: number;
-  text: string;
-  tone: ArenaLogTone;
-}
-
 /** 从本回合交战序列中抽取可读的战斗日志行。 */
-function arenaLogFromSequences(seqs: CombatSequenceV3[]): { text: string; tone: ArenaLogTone }[] {
-  const out: { text: string; tone: ArenaLogTone }[] = [];
+function arenaLogFromSequences(seqs: CombatSequenceV3[]): { text: string; tone: WagerLogLine['tone'] }[] {
+  const out: { text: string; tone: WagerLogLine['tone'] }[] = [];
   for (const seq of seqs) {
     for (const fact of seq.facts) {
       const atkName =
@@ -1807,7 +2465,7 @@ export const ViewArena: React.FC<ViewProps> = ({ state }) => {
     a: null,
     b: null,
   });
-  const [log, setLog] = useState<ArenaLogLine[]>([]);
+  const [log, setLog] = useState<WagerLogLine[]>([]);
   const [ended, setEnded] = useState(false);
   const [winnerId, setWinnerId] = useState<string | null>(null);
   const logEndRef = useRef<HTMLDivElement | null>(null);

@@ -64,6 +64,7 @@ import {
   recycleGear,
   gearAttrBonus,
   aggregateGearCombat,
+  gearSellPrice,
   createProtagonistGame,
   // v1.1.0：行动点
   ACTION_POINT_CAP,
@@ -1368,7 +1369,7 @@ function InventoryPanel(props: {
                         <span className="ml-1 rounded bg-zinc-800 px-1.5 py-0.5 text-[11px] text-zinc-400">
                           {g.rarityName ?? g.rarity}·{GEAR_SLOT_LABEL[g.slot]}
                         </span>
-                        <span className="shrink-0 text-[11px] text-zinc-500">⛁{g.value}</span>
+                        <span className="shrink-0 text-[11px] text-zinc-500">⛁{gearSellPrice(g)}</span>
                       </div>
                       {active && (
                         <button
@@ -1384,17 +1385,8 @@ function InventoryPanel(props: {
                         </button>
                       )}
                     </div>
-                    <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px]">
-                      {g.affixes.length > 0 && (
-                        <span className="text-emerald-300">{g.affixes.join('、')}</span>
-                      )}
-                      {(Object.keys(g.modifiers) as (keyof Attributes)[])
-                        .filter((k) => (g.modifiers[k] ?? 0) !== 0)
-                        .map((k) => (
-                          <span key={k} className="rounded bg-emerald-900/40 px-1.5 py-0.5 text-emerald-300">
-                            {attrLabel(k)}+{g.modifiers[k]}
-                          </span>
-                        ))}
+                    <div className="mt-1">
+                      <GearBonusChips gear={g} />
                     </div>
                   </li>
                 );

@@ -150,8 +150,9 @@ export function rollCombatInjuries(
   // 体质抗性：体质 10 → ×0.90；体质 25 → ×0.75（下限 0.6）；体质 40 → ×0.60（封底）
   const vitResist = Math.max(0.6, 1 - (attrs.vitality ?? 10) * 0.01);
 
-  // 震伤（全阶段）：血量满 ~12%，血量 30% ~39%，血量 10% ~46%
-  const shockP = (0.12 + 0.38 * (1 - p)) * willResist;
+  // 震伤：仅在血量受损（<100%）时才可能触发；血量越低概率越高
+  // 满血 0%，50% 约 22%，10% 约 40%（再受意志抗性削减）
+  const shockP = p >= 1 ? 0 : 0.45 * (1 - p) * willResist;
   if (rng() < shockP) out.push('shellShock');
 
   // 失血（<70%）：70% → 0%，30% → 约 26%，10% → 约 39%

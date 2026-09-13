@@ -33,7 +33,7 @@ import {
   rollGear,
   MATERIAL_LABEL,
 } from './economy';
-import { rebuildGearAtTier } from './affixes';
+import { rebuildGearAtTier, gearBaseValue } from './affixes';
 import { type RNG, randInt, emptyAttributes, weightedPick } from './rng';
 import {
   type MainSlotKey,
@@ -264,6 +264,10 @@ export interface SurvivalGameState {
   actionPointsAt?: number;
   /** 漫游搜打撤最近 10 条记录（v1.1.0：写入存档，不再只存组件内存） */
   wanderLog?: string[];
+  /** 末世赌局进行中的状态（v1.1.9：切出菜单后保留） */
+  wager?: import('./wager').WagerState;
+  /** 拍卖行进行中的状态（v1.1.9：本地单用户拍卖，30 分钟自动刷新） */
+  auction?: import('./auction').AuctionState;
 }
 
 export interface SortieLog {
@@ -1771,9 +1775,13 @@ export function materialSellPrice(m: MaterialItem): number {
   return Math.max(1, Math.round(m.value * 2));
 }
 
-/** 装备出售价：基础价值 ×（1 + 稀有度阶级 × 0.2），白 1.0× → 红 2.2× */
+/** 装备出售价：v1.1.9 起按「阶级 + 词条数」实时重算，不依赖可能为旧值的 g.value，
+ * 避免旧存档/已生成装备售出价值偏低。
+ */
 export function gearSellPrice(g: GearItem): number {
-  return Math.max(1, Math.round(g.value * (1 + (g.tier ?? 0) * 0.2)));
+  const tier = typeof g.tier === 'number' ? g.tier : 0;
+  const affixCount = Array.isArray(g.affixes) ? g.affixes.length : 1;
+  return Math.max(1, gearBaseValue(tier, affixCount));
 }
 
 /** 出售指定材料的若干件（数量自动夹到库存上限） */
@@ -1836,24 +1844,73 @@ export interface DailyQuest {
   rewardMedicineId?: MedicineSpec['id'];
 }
 
+/** 每日悬赏任务池（v1.1.9 扩至 10 个，覆盖出击/区域/撤离/出货等维度）。
+ *  id 前缀约定：q1 出击数 / q2 高危区域 / q3 搜刮 / q4 成功撤离 /
+ *              q5 地下 / q6 医院 / q7 研究所 / q8 军事 / q9 出货价值 / q10 大丰收 */
 export const DAILY_QUESTS: DailyQuest[] = [
   { id: 'q1', name: '每日出击·3 次', desc: '今日完成 3 次搜打撤（任意区域、任意结果）。', sortieTarget: 3, rewardCoins: 80 },
-  { id: 'q2', name: '远征·高危区域', desc: '今日完成 1 次危险等级 ≥4 的区域出击。', sortieTarget: 1, rewardCoins: 150, rewardMedicineId: 'antibiotic' },
-  { id: 'q3', name: '搜刮行家', desc: '今日累计搜刮 ≥5 次。', sortieTarget: 5, rewardCoins: 60 },
+  { id: 'q2', name: '远征·高危区域', desc: '今日完成 1 次危险等级 ≥4 的区域出击（地下/医院/研究所/军事）。', sortieTarget: 1, rewardCoins: 150, rewardMedicineId: 'antibiotic' },
+  { id: 'q3', name: '搜刮行家', desc: '今日累计搜刮 ≥6 次。', sortieTarget: 6, rewardCoins: 60 },
+  { id: 'q4', name: '成功撤离', desc: '今日以撤离成功结束 2 次出击。', sortieTarget: 2, rewardCoins: 100, rewardMedicineId: 'bandage' },
+  { id: 'q5', name: '地下清道夫', desc: '今日在「地下」区域完成 2 次出击。', sortieTarget: 2, rewardCoins: 120 },
+  { id: 'q6', name: '医院猎手', desc: '今日在「废弃医院」完成 2 次出击。', sortieTarget: 2, rewardCoins: 100, rewardMedicineId: 'medkit' },
+  { id: 'q7', name: '研究所探索', desc: '今日在「研究所」完成 1 次出击。', sortieTarget: 1, rewardCoins: 130, rewardMedicineId: 'serum' },
+  { id: 'q8', name: '军事禁区', desc: '今日在「军事基地」完成 1 次出击。', sortieTarget: 1, rewardCoins: 180 },
+  { id: 'q9', name: '小有斩获', desc: '今日撤离成功时累计带回价值 ≥500 的战利品。', sortieTarget: 500, rewardCoins: 100, rewardMedicineId: 'nutrient' },
+  { id: 'q10', name: '满载而归', desc: '今日撤离成功时累计带回价值 ≥1500 的战利品。', sortieTarget: 1500, rewardCoins: 200, rewardMedicineId: 'nanogel' },
 ];
 
 export function todayQuestsProgress(state: SurvivalGameState): { quest: DailyQuest; done: number; target: number; doneGoal: boolean; claimed: boolean }[] {
   const today = new Date().toISOString().slice(0, 10);
   const todays = state.sortieHistory.filter((s) => s.at.slice(0, 10) === today);
   const totalSorties = todays.length;
-  const highDangerSorties = todays.filter((s) => s.zoneName.includes('地下') || s.zoneName.includes('医院') || s.zoneName.includes('研究所') || s.zoneName.includes('军事')).length;
-  const totalSearches = todays.reduce((acc) => acc + 2, 0); // 估算：每次出击按 2 次搜刮
+  const successSorties = todays.filter((s) => s.outcome === 'success').length;
+  const highDangerSorties = todays.filter((s) =>
+    s.zoneName.includes('地下') || s.zoneName.includes('医院') || s.zoneName.includes('研究所') || s.zoneName.includes('军事'),
+  ).length;
+  const undergroundSorties = todays.filter((s) => s.zoneName.includes('地下')).length;
+  const hospitalSorties = todays.filter((s) => s.zoneName.includes('医院')).length;
+  const labSorties = todays.filter((s) => s.zoneName.includes('研究所')).length;
+  const militarySorties = todays.filter((s) => s.zoneName.includes('军事')).length;
+  // 估算：每次出击平均 2 次搜刮（兼容旧存档无精确计数）
+  const totalSearches = todays.reduce((acc) => acc + 2, 0);
+  // 仅统计撤离成功局带回的战利品总价值
+  const bankedValueSuccess = todays
+    .filter((s) => s.outcome === 'success')
+    .reduce((acc, s) => acc + (s.bankedValue ?? 0), 0);
   const claimed = (state as { claimedQuests?: string[] }).claimedQuests ?? [];
   return DAILY_QUESTS.map((q) => {
     let done = 0;
-    if (q.id === 'q1') done = totalSorties;
-    else if (q.id === 'q2') done = highDangerSorties;
-    else if (q.id === 'q3') done = totalSearches;
+    switch (q.id) {
+      case 'q1':
+        done = totalSorties;
+        break;
+      case 'q2':
+        done = highDangerSorties;
+        break;
+      case 'q3':
+        done = totalSearches;
+        break;
+      case 'q4':
+        done = successSorties;
+        break;
+      case 'q5':
+        done = undergroundSorties;
+        break;
+      case 'q6':
+        done = hospitalSorties;
+        break;
+      case 'q7':
+        done = labSorties;
+        break;
+      case 'q8':
+        done = militarySorties;
+        break;
+      case 'q9':
+      case 'q10':
+        done = bankedValueSuccess;
+        break;
+    }
     return {
       quest: q,
       done: Math.min(done, q.sortieTarget),

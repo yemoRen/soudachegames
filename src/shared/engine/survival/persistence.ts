@@ -10,7 +10,7 @@ import type { ExtractionRunState } from '../extraction/types';
 import { emptyGardenPlots, ACTION_POINT_CAP, START_SEEDS } from './state';
 import { getCurrentUser } from './account';
 import { DEPRECATED_PROTAGONIST_TRAIT_IDS, ensureBaseAttributes, tierFromPower, TIERS } from './chargen';
-import { buildGearName, gearTierName } from './affixes';
+import { buildGearName, gearBaseValue, gearTierName } from './affixes';
 
 const SAVE_PREFIX = 'wqqs-survival-save-v1:';
 const RUN_PREFIX = 'wqqs-survival-run-v1:';

@@ -378,9 +378,14 @@ function maybeContractInfection(state: ExtractionRunState, rng: () => number): v
   if (rng() >= INFECTION_CHANCE) return;
   if (state.injuries.includes('infection')) return;
   state.injuries = [...state.injuries, 'infection'];
+  // v1.1.9：感染生效时附带 5% 最大生命值侵蚀，避免「只加 debuff 不掉血」
+  const maxHp = state.condition.resources.hp.max ?? 1;
+  const infectDmg = Math.max(1, Math.round(maxHp * 0.05));
+  const before = state.condition.resources.hp.current;
+  state.condition.resources.hp.current = Math.max(1, before - infectDmg);
   plog(
     state,
-    `🤢 你在废墟的污浊环境里感染了！【感染】debuff 生效：体质/意志 -1/4，恢复速度 -50%。可用抗生素 / 血清 / 纳米凝胶清除。`,
+    `🤢 你在废墟的污浊环境里感染了！【感染】debuff 生效：体质/意志 -1/4，恢复速度 -50%，并承受 ${infectDmg} 点侵蚀伤害（${before} → ${state.condition.resources.hp.current}）。可用抗生素 / 血清 / 纳米凝胶清除。`,
   );
 }
 

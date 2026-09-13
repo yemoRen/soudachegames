@@ -208,6 +208,15 @@ const GEAR_SLOT_BASE: Record<GearSlot, Partial<Attributes>> = {
   accessory: { speed: 2, willpower: 2 },
 };
 
+/**
+ * 装备本身价值（即售出价值）：基础值随阶级与词条数线性成长，再乘稀有度系数（白 1.0× → 红 2.2×）。
+ * v1.1.9：让「显示价值」直接等于原售出价，避免两件价不一致。
+ */
+export function gearBaseValue(tier: number, affixCount: number): number {
+  const raw = 40 + tier * 45 + affixCount * 25;
+  return Math.max(1, Math.round(raw * (1 + tier * 0.2)));
+}
+
 // ===== 阶级抽取（随副本难度提升） =====
 
 // ===== v1.0.10：装备掉落品质权重表（按副本危险度 危1..危7）=====
@@ -466,7 +475,7 @@ export function rollGearDrop(
     modifiers,
     affixes: affixStrings,
     combat: Object.keys(combat).length ? combat : undefined,
-    value: Math.round(40 + tier * 45 + affixInstances.length * 25),
+    value: gearBaseValue(tier, affixInstances.length),
     tier,
     tierColor: t.color,
     rarityName: gearTierName(tier),
@@ -549,6 +558,6 @@ export function rebuildGearAtTier(
     modifiers,
     affixes: affixStrings,
     combat: Object.keys(combat).length ? combat : undefined,
-    value: Math.round(40 + tier * 45 + affixStrings.length * 25),
+    value: gearBaseValue(tier, affixStrings.length),
   };
 }

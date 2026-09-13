@@ -21,6 +21,10 @@ import {
   type DuelSession,
   type DuelRoundResolution,
 } from '@shared/engine/battle-v5/round/BattleAutoResolver';
+import { restoreBattleSave } from '@shared/engine/battle-v5/persistence/BattleStateCodec';
+import type { BattleSaveV1 } from '@shared/engine/battle-v5/persistence/types';
+import type { BattleStateTimelineV3 } from '@shared/engine/battle-v5/v3/types';
+import type { AbilitySelectionStrategy } from '@shared/engine/battle-v5/abilities/AbilitySelectionStrategy';
 
 export interface ArenaDuelHandle {
   session: DuelSession;
@@ -66,4 +70,36 @@ export function prepareArenaDuel(
 /** 推进对决一回合，返回本回合结算（含新存档 / 交战序列 / 状态帧 / 胜负）。 */
 export function arenaStep(session: DuelSession): DuelRoundResolution {
   return stepDuel(session);
+}
+
+/**
+ * v1.1.9：从持久化的 BattleSaveV1 重建可继续推进的 DuelSession。
+ * 用于切出/切回菜单时恢复末世赌局。
+ */
+export function restoreArenaDuelSession(
+  save: BattleSaveV1,
+  playerId: string,
+  opponentId: string,
+  initialTimeline: BattleStateTimelineV3,
+): DuelSession | null {
+  const runtime = new BattleRuntime();
+  const restored = restoreBattleSave(save);
+  try {
+    const strategies = new Map<string, AbilitySelectionStrategy>();
+    for (const unit of restored.roster.getAllUnits()) {
+      strategies.set(unit.id, unit.abilities.getSelectionStrategy());
+    }
+    return {
+      battleId: save.blueprint.battleId,
+      save,
+      selectionStrategies: strategies,
+      playerId,
+      opponentId,
+      initialTimeline,
+    };
+  } catch {
+    return null;
+  } finally {
+    restored.runtime.dispose();
+  }
 }
