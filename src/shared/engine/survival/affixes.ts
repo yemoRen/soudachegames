@@ -249,6 +249,22 @@ export const BOSS_GEAR_QUALITY_WEIGHTS: readonly (readonly number[])[] = [
   /* 危7 */ [1, 4, 12, 22, 24, 24, 13],
 ];
 
+/**
+ * 蜃景密室专属掉落分布（掉落装备时品质权重，%）。
+ * 高风险高回报：整体比 BOSS 表更豪——低难保底蓝装、高阶橙红更肥。
+ * 仅 mirageChamber 调用，不影响任何正常副本 / 搜刮 / 霸主掉落。
+ */
+export const MIRAGE_GEAR_QUALITY_WEIGHTS: readonly (readonly number[])[] = [
+  //        白   绿   蓝   紫   黄   橙   红
+  /* 危1 */ [10, 30, 40, 15, 5, 0, 0],
+  /* 危2 */ [6, 24, 40, 20, 7, 3, 0],
+  /* 危3 */ [3, 18, 38, 25, 10, 5, 1],
+  /* 危4 */ [1, 12, 34, 28, 15, 8, 2],
+  /* 危5 */ [0, 8, 28, 30, 18, 12, 4],
+  /* 危6 */ [0, 4, 22, 28, 20, 18, 8],
+  /* 危7 */ [0, 2, 14, 24, 22, 24, 14],
+];
+
 /** 危险度归一到 1..7（副本难度统一为危1~危7） */
 export function clampDanger(dangerLevel: number): number {
   const d = Math.round(Number.isFinite(dangerLevel) ? dangerLevel : 1);
@@ -274,9 +290,14 @@ export function rollGearTier(
   dangerLevel: number,
   boss = false,
   luckBias = 0,
+  mirage = false,
 ): number {
   const d = clampDanger(dangerLevel);
-  const table = (boss ? BOSS_GEAR_QUALITY_WEIGHTS : MOB_GEAR_QUALITY_WEIGHTS)[d - 1];
+  const table = (mirage
+    ? MIRAGE_GEAR_QUALITY_WEIGHTS
+    : boss
+      ? BOSS_GEAR_QUALITY_WEIGHTS
+      : MOB_GEAR_QUALITY_WEIGHTS)[d - 1];
   const gamma = Math.max(-0.5, Math.min(1, luckBias)) * 0.35;
   const candidates = table.map((base, tier) => ({
     value: tier,
@@ -419,10 +440,12 @@ export function rollGearDrop(
   luckBias = 0.1,
   minTier = 0,
   boss = false,
+  mirage = false,
 ): LootItemGear {
   // v1.0.10：改为查表（危1~危7 的小怪 / 霸主品质权重），保底品阶仍可叠加
+  // mirage=true 时走蜃景密室专属表，不影响其他副本 / 搜刮 / 霸主掉落
   const tier = Math.max(
-    rollGearTier(rng, dangerLevel, boss, luckBias),
+    rollGearTier(rng, dangerLevel, boss, luckBias, mirage),
     Math.max(0, Math.min(6, minTier)),
   );
   const t = tierByTier(tier);

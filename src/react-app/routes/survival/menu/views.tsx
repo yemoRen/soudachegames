@@ -82,9 +82,19 @@ import {
   recycleGear,
   activeSurvivor,
   reforgeEquippedGear,
+  fullHealTeam,
+  addSummonedSurvivor,
+  upgradeEquippedGearTier,
+  addRedeemTicket,
+  useBackboneRecruitTicket,
 } from '@shared/engine/survival/state';
 import { saveGame } from '@shared/engine/survival/persistence';
 import { getCurrentUser } from '@shared/engine/survival/account';
+import {
+  runMirageChamber,
+  MIRAGE_AP_COST,
+  type MirageResult,
+} from '@shared/engine/survival/mirageChamber';
 import { compressToBase64, decompressFromBase64 } from 'lz-string';
 import type { RNG } from '@shared/engine/survival/rng';
 import {
@@ -961,61 +971,130 @@ export const ViewWandering: React.FC<ViewProps> = ({ state, mutate, rng }) => {
   );
 };
 
-// ===== 8. 蜃景密室（高危特殊区域） =====
+// ===== 8. 蜃景密室（高危 boss 连战，v1.1.10 实装） =====
 export const ViewMirage: React.FC<ViewProps> = ({ state, mutate, rng }) => {
-  const unlockCost = 200;
-  const alreadyUnlocked = (state as { mirageUnlocked?: boolean }).mirageUnlocked === true;
-  const unlocked = alreadyUnlocked;
+  const active = state.survivors.find((s) => s.id === state.activeSurvivorId) ?? null;
+  const status = active ? state.survivorStatus[active.id] : undefined;
+  const ap = actionPointView(state, Date.now());
+  const dying =
+    !!status?.dyingUntil && new Date(status.dyingUntil).getTime() > Date.now();
+  const canEnter = !!active && !!status && !dying && ap.current >= MIRAGE_AP_COST;
+
+  // 初始化：若存档里有上次连战日志则直接展示
+  const [result, setResult] = useState<MirageResult | null>(() =>
+    state.mirage && state.mirage.log.length > 0
+      ? {
+          ok: true,
+          survivorName: active?.name,
+          rounds: [],
+          cleared: state.mirage.cleared,
+          totalDrops: [],
+          finalHp: status?.currentHp ?? 0,
+          maxHp: status?.maxHp ?? 0,
+          log: state.mirage.log,
+        }
+      : null,
+  );
+  const [busy, setBusy] = useState(false);
+
   const enter = () => {
-    const active = state.survivors.find((s) => s.id === state.activeSurvivorId);
-    if (!active) return;
-    const loadout = buildSortieLoadout(state, active.id);
-    if (!loadout) return;
-    const zone = DANGER_ZONES[4] ?? DANGER_ZONES[DANGER_ZONES.length - 1]; // 地下研究所
-    const seed = Math.floor(rng() * 2 ** 31);
-    const localRng = mulberry32(seed);
-    const run = createRun(loadout, zone);
-    search(run, localRng);
-    search(run, localRng);
-    const enemy = run.encounter?.enemy;
-    if (enemy) fight(run, enemy, localRng);
-    rollRescue(run, localRng, () => generateSurvivor(rng));
-    extract(run);
-    const outcome = run.phase === 'dead' ? 'death' : 'success';
-    mutate((s) => {
-      let ns = bankLoot(s, run.bankedLoot);
-      if (run.bankedNpc) ns = addRecruit(ns, run.bankedNpc);
-      return applySortieResult(ns, {
-        survivorId: active.id,
-        survivorName: active.name,
-        zoneName: zone.name,
-        outcome,
-        bankedItems: run.bankedLoot.length,
-        bankedValue: sumValue(run.bankedLoot),
-        enemyFaced: enemy?.name,
-        rescued: !!run.bankedNpc,
-        finalHp: run.condition.resources.hp.current,
-        maxHp: run.condition.resources.hp.max ?? 100,
-      });
-    });
+    if (!active || busy || !canEnter) return;
+    setBusy(true);
+    const res = runMirageChamber(state, active.id, rng, Date.now());
+    if (res.result.ok) {
+      mutate(() => res.state);
+      setResult(res.result);
+    } else {
+      setResult(res.result);
+    }
+    setBusy(false);
   };
+
   return (
-    <Section title="蜃景密室" subtitle="危险等级 5 的扭曲时空，高风险高回报。">
-      {!unlocked ? (
+    <Section title="蜃景密室" subtitle="危险等级 7 的扭曲时空，高风险高回报。">
+      <Card className="mb-3 !bg-violet-950/20">
+        <div className="text-sm text-zinc-200">
+          消耗 <b className="text-amber-300">{MIRAGE_AP_COST}</b> 行动点，派当前出击者连战危1 → 危7 的 7 名 boss：
+        </div>
+        <ul className="mt-2 list-disc space-y-0.5 pl-5 text-[12px] text-zinc-400">
+          <li>连战无休息——血量跨场继承，越往后越凶险；</li>
+          <li>无经验获取，但每击败一名 boss 必掉落两件带阶级词缀的战利品；</li>
+          <li>中途阵亡即结束，成员进入濒死（需救治）；通关则携战利品全身而退。</li>
+        </ul>
+        <div className="mt-3 flex items-center justify-between text-xs">
+          <span className="text-zinc-400">
+            当前出击者：<b className="text-zinc-100">{active?.name ?? '无'}</b>
+            {status && `（${status.currentHp}/${status.maxHp}）`}
+          </span>
+          <span className="text-zinc-400">
+            行动点：
+            <b className={ap.current >= MIRAGE_AP_COST ? 'text-emerald-300' : 'text-rose-300'}>
+              {ap.current}/{ap.cap}
+            </b>
+          </span>
+        </div>
+        {dying && <div className="mt-2 text-xs text-rose-300">⚠ 该成员处于濒死状态，无法进入。</div>}
+        <button
+          onClick={enter}
+          disabled={!canEnter || busy}
+          className="mt-3 rounded bg-violet-600 px-4 py-2 text-sm font-medium text-white hover:bg-violet-700 disabled:opacity-40"
+        >
+          {busy ? '连战中…' : `进入蜃景密室（耗 ${MIRAGE_AP_COST} 行动点）`}
+        </button>
+        {!active && <div className="mt-2 text-xs text-zinc-500">请先在避难所选好出击者。</div>}
+        {active && !dying && ap.current < MIRAGE_AP_COST && (
+          <div className="mt-2 text-xs text-rose-300">
+            行动点不足，需 {MIRAGE_AP_COST} 点（每 5 分钟恢复 1 点）。
+          </div>
+        )}
+      </Card>
+
+      {result && (
         <Card>
-          <div className="text-sm text-zinc-200">解锁费用 {unlockCost} 废土币（一次性）。</div>
-          <button
-            onClick={() => state.coins >= unlockCost && mutate((s) => ({ ...s, coins: s.coins - unlockCost, mirageUnlocked: true } as SurvivalGameState))}
-            disabled={state.coins < unlockCost}
-            className="mt-3 rounded bg-purple-600 px-4 py-2 text-white hover:bg-purple-700 disabled:opacity-40"
-          >
-            消耗 {unlockCost} 进入
-          </button>
-        </Card>
-      ) : (
-        <Card>
-          <div className="text-sm text-zinc-200">已解锁。每点一次按钮即派当前出击者跑一次最高危区域。</div>
-          <button onClick={enter} className="mt-3 rounded bg-purple-600 px-4 py-2 text-white hover:bg-purple-700">进入蜃景密室</button>
+          <div className="flex items-center justify-between">
+            <div className="font-semibold text-zinc-100">
+              战斗日志
+              {result.cleared ? (
+                <span className="text-emerald-300"> · 全 7 关通关 🏆</span>
+              ) : (
+                <span className="text-rose-300"> · 中途阵亡</span>
+              )}
+            </div>
+            {result.totalDrops.length > 0 && (
+              <div className="text-xs text-amber-300">获得装备 ×{result.totalDrops.length}</div>
+            )}
+          </div>
+          <div className="mt-2 max-h-80 overflow-y-auto rounded bg-zinc-950/60 p-2 font-mono text-[11px] leading-relaxed text-zinc-300">
+            {result.log.map((line, i) => (
+              <div
+                key={i}
+                className={
+                  line.includes('🎁')
+                    ? 'text-emerald-300'
+                    : line.includes('❌') || line.includes('⚠')
+                      ? 'text-rose-300'
+                      : line.includes('🏆')
+                        ? 'text-amber-300'
+                        : ''
+                }
+              >
+                {line}
+              </div>
+            ))}
+          </div>
+          {result.totalDrops.length > 0 && (
+            <div className="mt-2 flex flex-wrap gap-1">
+              {result.totalDrops.map((g, i) => (
+                <span
+                  key={i}
+                  className="rounded border px-1.5 py-0.5 text-[10px]"
+                  style={{ borderColor: `${g.tierColor}66`, color: g.tierColor }}
+                >
+                  {g.name}
+                </span>
+              ))}
+            </div>
+          )}
         </Card>
       )}
     </Section>
@@ -1591,29 +1670,199 @@ export const ViewReforge: React.FC<ViewProps> = ({ state, mutate, rng }) => {
   );
 };
 
-// ===== 13. 英雄商城（钻石货币占位） =====
-export const ViewPremiumShop: React.FC<ViewProps> = ({ state, mutate }) => {
-  const items = [
-    { id: 'p1', name: '钢铁幸存者召唤券', cost: 100, desc: '使用后获得一名钢铁幸存者（段位4 资质）。' },
-    { id: 'p2', name: '全队满血包', cost: 30, desc: '所有幸存者立即满血。' },
-    { id: 'p3', name: '装备升星符', cost: 50, desc: '将一件装备升 1 级。' },
-  ];
-  const premium = (state as { premiumCoins?: number }).premiumCoins ?? 0;
+// ===== 13. 英雄商城（废土钻石 premiumCoins 购买稀有道具，v1.1.10 实装） =====
+export const ViewPremiumShop: React.FC<ViewProps> = ({ state, mutate, rng }) => {
+  const premium = state.premiumCoins ?? 0;
+  const charms = state.tierCharms ?? 0;
+  const hero = activeSurvivor(state);
+  const slots: GearSlot[] = ['weapon', 'offWeapon', 'head', 'armor', 'legs', 'accessory'];
+  const equipped = state.equipped[hero?.id ?? ''] ?? {};
+
+  const [toast, setToast] = useState<string | null>(null);
+  const [useCharm, setUseCharm] = useState(false);
+  const [confirmSlot, setConfirmSlot] = useState<GearSlot | null>(null);
+  const [lastResult, setLastResult] = useState<{ name: string; tierUp: boolean } | null>(null);
+  const [gmUnlocked, setGmUnlocked] = useState(() => readGmUnlocked());
+
+  // 用废土钻石购买：校验 + 扣钻 + 应用效果；effect 在 apply 内完成（caller 已校验钻充足）
+  const buy = (cost: number, label: string, apply: (s: SurvivalGameState) => SurvivalGameState) => {
+    if (premium < cost) {
+      setToast(`⚠️ 废土钻石不足，需要 ${cost}（当前 ${premium}）。`);
+      return;
+    }
+    mutate((s) => {
+      if ((s.premiumCoins ?? 0) < cost) return s;
+      const spent = { ...s, premiumCoins: (s.premiumCoins ?? 0) - cost };
+      return apply(spent);
+    });
+    setToast(`✅ 已用 ${cost} 废土钻石购买：${label}。`);
+  };
+
+  const onBuySummon = () => {
+    if (state.survivors.length >= WARBAND_CAP) {
+      setToast('⚠️ 战团已满，招募需先遣散。');
+      return;
+    }
+    buy(100, '钢铁幸存者招募券', (s) => addSummonedSurvivor(s, generateSurvivor(rng, { genTier: 4 }), Date.now()));
+  };
+  const onBuyHeal = () => buy(20, '全队满血包', (s) => fullHealTeam(s, Date.now()));
+  const onBuyCharm = () => buy(200, '装备升阶符', (s) => ({ ...s, tierCharms: (s.tierCharms ?? 0) + 1 }));
+
+  const onUseCharm = (slot: GearSlot) => {
+    if (!hero) return;
+    const res = upgradeEquippedGearTier(state, rng, hero.id, slot);
+    if (!res.gear) {
+      setToast('该槽位没有装备或升阶符不足。');
+      setConfirmSlot(null);
+      return;
+    }
+    mutate(() => res.state);
+    setConfirmSlot(null);
+    setUseCharm(false);
+    setLastResult({ name: res.gear.name, tierUp: res.tierUp });
+  };
+
+  const shopBtn = (disabled: boolean, onClick: () => void, label: string) => (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      className="mt-3 rounded bg-amber-600 px-3 py-1 text-xs text-white hover:bg-amber-700 disabled:opacity-40"
+    >
+      {label}
+    </button>
+  );
+
   return (
-    <Section title="英雄商城" subtitle="使用废土钻石（演示货币）购买稀有道具。">
+    <Section
+      title="英雄商城"
+      subtitle="使用废土钻石购买稀有道具。"
+      right={<span className="text-xs text-amber-300">当前废土钻石：{premium}</span>}
+    >
+      {toast && (
+        <div className="rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-2 text-sm text-zinc-200">{toast}</div>
+      )}
+
       <Card className="mb-3 !bg-amber-950/30">
-        <div className="text-sm text-amber-300">当前钻石：{premium}</div>
-        <button onClick={() => mutate((s) => ({ ...s, premiumCoins: (premium ?? 0) + 10 } as SurvivalGameState))} className="mt-2 rounded bg-amber-600 px-3 py-1 text-xs text-white hover:bg-amber-700">+10（演示按钮）</button>
+        <div className="text-sm text-amber-300">废土钻石：{premium}</div>
+        <p className="mt-1 text-[11px] text-zinc-500">钻石为高级货币，用于兑换英雄商城的稀有道具。</p>
+        {gmUnlocked && (
+          <button
+            onClick={() => mutate((s) => ({ ...s, premiumCoins: (s.premiumCoins ?? 0) + 20 }))}
+            className="mt-2 rounded bg-amber-600 px-3 py-1 text-xs text-white hover:bg-amber-700"
+          >
+            +20（演示按钮）
+          </button>
+        )}
       </Card>
+
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-        {items.map((it) => (
-          <Card key={it.id}>
-            <div className="font-semibold text-zinc-100">{it.name}</div>
-            <div className="mt-1 text-xs text-zinc-400">{it.desc}</div>
-            <button disabled className="mt-3 rounded bg-zinc-700 px-3 py-1 text-xs text-white">兑换（暂未开放）</button>
-          </Card>
-        ))}
+        {/* 钢铁幸存者招募券 */}
+        <Card>
+          <div className="font-semibold text-zinc-100">钢铁幸存者招募券</div>
+          <div className="mt-1 text-xs text-zinc-400">使用后获得一名钢铁幸存者（段位4 资质）。</div>
+          <div className="mt-2 text-xs text-amber-300">100 废土钻石</div>
+          {shopBtn(premium < 100, onBuySummon, '兑换（100 钻石）')}
+        </Card>
+
+        {/* 全队满血包 */}
+        <Card>
+          <div className="font-semibold text-zinc-100">全队满血包</div>
+          <div className="mt-1 text-xs text-zinc-400">所有幸存者立即满血、清除全部伤势与濒死状态。</div>
+          <div className="mt-2 text-xs text-amber-300">20 废土钻石</div>
+          {shopBtn(premium < 20, onBuyHeal, '兑换（20 钻石）')}
+        </Card>
+
+        {/* 装备升阶符 */}
+        <Card>
+          <div className="font-semibold text-zinc-100">装备升阶符</div>
+          <div className="mt-1 text-xs text-zinc-400">对当前出击者的一件已装备升 1 阶（最高神话）。持有 {charms} 张。</div>
+          <div className="mt-2 text-xs text-amber-300">200 废土钻石</div>
+          {shopBtn(premium < 200, onBuyCharm, '兑换（200 钻石）')}
+          {charms > 0 && (
+            <button
+              onClick={() => setUseCharm((v) => !v)}
+              className="ml-2 mt-3 rounded bg-stone-600 px-3 py-1 text-xs text-white hover:bg-stone-700"
+            >
+              选择使用（{charms}）
+            </button>
+          )}
+        </Card>
       </div>
+
+      {/* 升阶符使用面板：列出当前出击者装备栏，逐件升阶（二次确认） */}
+      {useCharm && (
+        <Card className="mt-3">
+          <div className="font-semibold text-zinc-100">
+            装备升阶符 · 选择使用
+            <span className="ml-2 text-xs font-normal text-zinc-500">当前出击者：{hero ? hero.name : '未指定'}</span>
+          </div>
+          {!hero ? (
+            <div className="mt-2 text-xs text-zinc-500">请先在战团界面选择一名当前出击者。</div>
+          ) : (
+            <div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+              {slots.map((slot) => {
+                const gearId = equipped[slot];
+                const gear = gearId ? state.gear.find((g) => g.id === gearId) : undefined;
+                const isMax = (gear?.tier ?? 0) >= 6;
+                return (
+                  <div key={slot} className="rounded border border-zinc-800 p-2">
+                    <div className="text-xs text-zinc-400">{GEAR_SLOT_LABEL[slot]}</div>
+                    {gear ? (
+                      <>
+                        <div className="mt-1 text-sm font-medium" style={{ color: gear.tierColor ?? '#e4e4e7' }}>
+                          {gear.name}
+                        </div>
+                        <div className="text-[11px] text-zinc-500">
+                          {gear.rarityName ?? gear.rarity} · {gear.affixes.length} 词条
+                        </div>
+                        {confirmSlot === slot ? (
+                          <div className="mt-2 flex gap-2">
+                            <button
+                              onClick={() => onUseCharm(slot)}
+                              disabled={charms <= 0}
+                              className="rounded bg-amber-600 px-2 py-1 text-[11px] text-white hover:bg-amber-700 disabled:opacity-40"
+                            >
+                              确认升阶
+                            </button>
+                            <button
+                              onClick={() => setConfirmSlot(null)}
+                              className="rounded bg-zinc-700 px-2 py-1 text-[11px] text-white hover:bg-zinc-600"
+                            >
+                              取消
+                            </button>
+                          </div>
+                        ) : (
+                          <button
+                            onClick={() => setConfirmSlot(slot)}
+                            disabled={charms <= 0 || isMax}
+                            className="mt-2 rounded bg-amber-600 px-2 py-1 text-[11px] text-white hover:bg-amber-700 disabled:opacity-40"
+                          >
+                            {isMax ? '已是最高阶' : '升阶'}
+                          </button>
+                        )}
+                      </>
+                    ) : (
+                      <div className="mt-2 text-xs text-zinc-600">（空）</div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </Card>
+      )}
+
+      {lastResult && (
+        <div className="mt-4 rounded-lg border border-zinc-800 bg-zinc-900 p-3 text-sm">
+          <div className="font-semibold text-zinc-200">
+            {lastResult.tierUp ? '🎉 升阶成功！' : '升阶符已使用'}
+          </div>
+          <div className="mt-1 text-zinc-400">
+            {lastResult.name}
+            {lastResult.tierUp ? ' 阶级已提升。' : '（已是最高阶，未消耗升阶符）'}
+          </div>
+        </div>
+      )}
     </Section>
   );
 };
@@ -2718,32 +2967,68 @@ export const ViewNews: React.FC<ViewProps> = ({ state }) => {
 };
 
 // ===== 19. 兑换码 =====
-export const ViewRedeem: React.FC<ViewProps> = ({ state, mutate }) => {
+export const ViewRedeem: React.FC<ViewProps> = ({ state, mutate, rng }) => {
   const [code, setCode] = useState('');
   const [msg, setMsg] = useState<string | null>(null);
+  const [pendingTicket, setPendingTicket] = useState<string | null>(null);
+
+  type RedeemReward = { coins?: number; med?: 'bandage' | 'antibiotic' | 'medkit'; qty?: number; ticket?: string; ticketQty?: number };
+  const valid: Record<string, RedeemReward> = {
+    'WASTELAND2026': { coins: 200, med: 'bandage', qty: 3 },
+    'FIRSTSTEP': { coins: 100 },
+    'LASTHOPE': { coins: 500, med: 'medkit', qty: 1 },
+    'CESHI1': { ticket: 'backbone-recruit', ticketQty: 1 },
+  };
+
   const apply = () => {
-    const valid: Record<string, { coins: number; med?: 'bandage' | 'antibiotic' | 'medkit'; qty?: number }> = {
-      'WASTELAND2026': { coins: 200, med: 'bandage', qty: 3 },
-      'FIRSTSTEP': { coins: 100 },
-      'LASTHOPE': { coins: 500, med: 'medkit', qty: 1 },
-    };
-    const used = (state as { redeemedCodes?: string[] }).redeemedCodes ?? [];
     if (!valid[code]) {
       setMsg('兑换码无效');
       return;
     }
+    const used = state.redeemedCodes ?? [];
     if (used.includes(code)) {
       setMsg('该兑换码已使用');
       return;
     }
     const r = valid[code];
     mutate((s) => {
-      const ns: SurvivalGameState = { ...s, coins: s.coins + r.coins, redeemedCodes: [...used, code] } as SurvivalGameState;
+      const codes = s.redeemedCodes ?? [];
+      if (codes.includes(code)) return s;
+      const ns: SurvivalGameState = { ...s, coins: s.coins + (r.coins ?? 0), redeemedCodes: [...codes, code] };
       if (r.med) ns.medicines = { ...ns.medicines, [r.med]: (ns.medicines[r.med] ?? 0) + (r.qty ?? 1) };
+      if (r.ticket) {
+        ns.redeemTickets = { ...(ns.redeemTickets ?? {}), [r.ticket]: ((ns.redeemTickets ?? {})[r.ticket] ?? 0) + (r.ticketQty ?? 1) };
+      }
       return ns;
     });
-    setMsg(`兑换成功：+${r.coins} 废土币${r.med ? ` +${r.med}×${r.qty ?? 1}` : ''}`);
+    const parts: string[] = [];
+    if (r.coins) parts.push(`+${r.coins} 废土币`);
+    if (r.med) parts.push(`+${r.qty ?? 1}×${r.med}`);
+    if (r.ticket) parts.push('+战团骨干招募券×1');
+    setMsg(`兑换成功：${parts.join('、')}`);
   };
+
+  const tickets = Object.entries(state.redeemTickets ?? {}).filter(([_, qty]) => qty > 0);
+
+  const useTicket = (ticketId: string) => {
+    if (ticketId !== 'backbone-recruit') return;
+    const res = useBackboneRecruitTicket(state, rng, Date.now());
+    if (res.full) {
+      setMsg('⚠️ 战团已满，招募需先遣散。');
+      setPendingTicket(null);
+      return;
+    }
+    if (!res.npc) {
+      setMsg('没有可使用的战团骨干招募券。');
+      return;
+    }
+    mutate(() => res.state);
+    setMsg(
+      `✅ 战团骨干招募券使用成功：${res.npc.name}（${res.npc.tierName}）已加入战团。`,
+    );
+    setPendingTicket(null);
+  };
+
   return (
     <Section title="兑换码" subtitle="输入官方兑换码获得物资。">
       <Card>
@@ -2757,8 +3042,43 @@ export const ViewRedeem: React.FC<ViewProps> = ({ state, mutate }) => {
           <button onClick={apply} className="rounded bg-emerald-600 px-4 py-2 text-sm text-white hover:bg-emerald-700">兑换</button>
         </div>
         {msg && <div className="mt-2 text-xs text-zinc-300">{msg}</div>}
-        <div className="mt-3 text-xs text-zinc-500">演示码：WASTELAND2026 / FIRSTSTEP / LASTHOPE</div>
       </Card>
+
+      {tickets.length > 0 && (
+        <Card className="mt-3">
+          <div className="font-semibold text-zinc-100">已兑换道具</div>
+          <div className="mt-2 flex flex-wrap gap-2">
+            {tickets.map(([id, qty]) => (
+              <div key={id} className="flex items-center gap-2 rounded border border-zinc-800 bg-zinc-900 px-2 py-1">
+                <span className="text-xs text-zinc-300">战团骨干招募券 ×{qty}</span>
+                {pendingTicket === id ? (
+                  <div className="flex gap-1">
+                    <button
+                      onClick={() => useTicket(id)}
+                      className="rounded bg-emerald-600 px-2 py-0.5 text-[11px] text-white hover:bg-emerald-700"
+                    >
+                      确认使用
+                    </button>
+                    <button
+                      onClick={() => setPendingTicket(null)}
+                      className="rounded bg-zinc-700 px-2 py-0.5 text-[11px] text-white hover:bg-zinc-600"
+                    >
+                      取消
+                    </button>
+                  </div>
+                ) : (
+                  <button
+                    onClick={() => setPendingTicket(id)}
+                    className="rounded bg-amber-600 px-2 py-0.5 text-[11px] text-white hover:bg-amber-700"
+                  >
+                    使用
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        </Card>
+      )}
     </Section>
   );
 };
@@ -2767,7 +3087,7 @@ export const ViewRedeem: React.FC<ViewProps> = ({ state, mutate }) => {
 export const ViewMerit: React.FC<ViewProps> = ({ state }) => {
   const merit = state.sortieHistory.filter((s) => s.rescued).length;
   const deaths = state.sortieHistory.filter((s) => s.outcome === 'death').length;
-  const recruits = state.recruits.length + merit;
+  const totalRecruits = state.totalRecruits ?? Math.max(1, state.survivors.length);
   return (
     <Section title="救济簿" subtitle="系统自动统计你的善举与代价。">
       <Card>
@@ -2777,8 +3097,8 @@ export const ViewMerit: React.FC<ViewProps> = ({ state }) => {
             <div className="mt-1 text-xs text-zinc-400">累计救援</div>
           </div>
           <div>
-            <div className="text-2xl font-bold text-amber-300">{recruits}</div>
-            <div className="mt-1 text-xs text-zinc-400">待招募集合</div>
+            <div className="text-2xl font-bold text-amber-300">{totalRecruits}</div>
+            <div className="mt-1 text-xs text-zinc-400">累计招募</div>
           </div>
           <div>
             <div className="text-2xl font-bold text-rose-300">{deaths}</div>
@@ -3572,7 +3892,7 @@ export const ViewMedical: React.FC<ViewProps> = ({ state, mutate, setState }) =>
                     key={m.id}
                     onClick={() => mutate((st) => applyMedicineToSurvivor(st, s.id, m.id))}
                     className="rounded bg-sky-600 px-3 py-1 text-xs text-white hover:bg-sky-700"
-                  >使用 {m.name}（{medEffectShort(m)}）</button>
+                  >使用 {m.name}（{medEffectShort(m)}）x{state.medicines[m.id] ?? 0}</button>
                 ))}
                 {MEDICINES.every((m) => (state.medicines[m.id] ?? 0) === 0) && (
                   <span className="text-xs text-zinc-500">没有医疗品了，去「废土市场」购买</span>

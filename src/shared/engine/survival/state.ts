@@ -254,6 +254,12 @@ export interface SurvivalGameState {
   worldSeed?: number;
   mirageUnlocked?: boolean;
   premiumCoins?: number;
+  /** 英雄商城购买的「装备升阶符」持有数（v1.1.10：200 钻石/张，对当前出击者已装备升 1 阶） */
+  tierCharms?: number;
+  /** 累计招募数（v1.1.10：救济簿统计；主角计 1，后续入队/收编累加） */
+  totalRecruits?: number;
+  /** 兑换码兑换的道具券库存（v1.1.10：key → 数量，如 { 'backbone-recruit': 1 }） */
+  redeemTickets?: Record<string, number>;
   redeemedCodes?: string[];
   /** 玩家注册代号；重置存档后用于重生同名主角（可选，兼容旧存档） */
   playerCodename?: string;
@@ -268,6 +274,8 @@ export interface SurvivalGameState {
   wager?: import('./wager').WagerState;
   /** 拍卖行进行中的状态（v1.1.9：本地单用户拍卖，30 分钟自动刷新） */
   auction?: import('./auction').AuctionState;
+  /** 蜃景密室最近一次连战的战斗日志（v1.1.10：持久化保留，切出切回仍可查看） */
+  mirage?: { log: string[]; cleared: boolean; at: number };
 }
 
 export interface SortieLog {
@@ -437,6 +445,8 @@ export function newGame(): SurvivalGameState {
     sortieHistory: [],
     log: ['【系统】避难所已建立，开始末世求生。'],
     playerCodename: '',
+    totalRecruits: 0,
+    redeemTickets: {},
     // v1.1.0：行动点初始满点
     actionPoints: ACTION_POINT_CAP,
     actionPointsAt: now,
@@ -464,6 +474,7 @@ export function createProtagonistGame(name: string, now: number = Date.now()): S
     activeSurvivorId: hero.id,
     survivorStatus: status,
     playerCodename: name,
+    totalRecruits: 1,
     log: [`【系统】代号「${name}」已在避难所登记，开启末世求生。`, ...base.log].slice(0, 50),
   };
 }
@@ -499,6 +510,7 @@ export function recruitSurvivor(
     ...state,
     coins: state.coins - cost,
     survivors: [...state.survivors, s],
+    totalRecruits: (state.totalRecruits ?? 1) + 1,
     log: [`【招募】新幸存者 ${s.name} 加入避难所（${s.tierName}）。`, ...state.log].slice(0, 50),
   };
 }
@@ -1125,6 +1137,141 @@ export function oneClickHeal(
   };
 }
 
+// ===== 英雄商城（废土钻石 premiumCoins 购买稀有道具，v1.1.10） =====
+
+/**
+ * 全队满血包：所有幸存者立即满血、清除全部伤势与濒死、恢复可出击状态。
+ * （废土钻石的扣除在商城 UI 侧完成，本函数只负责回血效果；caller 已校验钻石充足。）
+ */
+export function fullHealTeam(state: SurvivalGameState, now: number = Date.now()): SurvivalGameState {
+  const nextStatus: Record<string, SurvivorStatus> = {};
+  for (const [id, st] of Object.entries(state.survivorStatus)) {
+    nextStatus[id] = {
+      ...st,
+      currentHp: st.maxHp,
+      injuries: [],
+      dyingUntil: undefined,
+      lastRecoveredAt: new Date(now).toISOString(),
+      sortieReady: true,
+    };
+  }
+  const count = Object.keys(state.survivorStatus).length;
+  return {
+    ...state,
+    survivorStatus: nextStatus,
+    log: count > 0
+      ? [`【英雄商城】全队满血包生效：全员生命全满、伤势清零、状态恢复。`, ...state.log].slice(0, 50)
+      : state.log,
+  };
+}
+
+/**
+ * 把一名幸存者加入战团（战团有空位时直接入伙并建状态），否则进入候补招募列表。
+ * 用于「钢铁幸存者招募券」：段位4 资质直接入队。
+ */
+export function addSummonedSurvivor(
+  state: SurvivalGameState,
+  npc: SurvivorProfile,
+  now: number = Date.now(),
+): SurvivalGameState {
+  if (state.survivors.length < WARBAND_CAP) {
+    const status: Record<string, SurvivorStatus> = { ...state.survivorStatus };
+    status[npc.id] = freshStatus(npc, now);
+    return {
+      ...state,
+      survivors: [...state.survivors, npc],
+      survivorStatus: status,
+      activeSurvivorId: state.activeSurvivorId ?? npc.id,
+      totalRecruits: (state.totalRecruits ?? 1) + 1,
+      log: [`【英雄商城】钢铁幸存者招募券生效：${npc.name}（${npc.tierName}）加入战团。`, ...state.log].slice(0, 50),
+    };
+  }
+  // 战团已满：进入候补招募列表，不浪费
+  return addRecruit(state, npc);
+}
+
+/**
+ * 装备升阶符：将指定幸存者某槽位已装备的装备升 1 阶（最高红阶 6，保留 id 与槽位），
+ * 消耗 1 张升阶符。已是红阶则不升阶、不消耗，仅提示。
+ */
+export function upgradeEquippedGearTier(
+  state: SurvivalGameState,
+  rng: RNG,
+  survivorId: string,
+  slot: GearSlot,
+): { state: SurvivalGameState; gear?: GearItem; tierUp: boolean; capped: boolean } {
+  if ((state.tierCharms ?? 0) <= 0) return { state, tierUp: false, capped: false };
+  const gearId = state.equipped[survivorId]?.[slot];
+  if (!gearId) return { state, tierUp: false, capped: false };
+  const index = state.gear.findIndex((g) => g.id === gearId);
+  if (index < 0) return { state, tierUp: false, capped: false };
+
+  const old = state.gear[index];
+  const oldTier = old.tier ?? 0;
+  if (oldTier >= 6) {
+    return {
+      state: {
+        ...state,
+        log: [`【升阶符】${old.name} 已是最高阶（神话），无法继续升阶。`, ...state.log].slice(0, 50),
+      },
+      gear: old,
+      tierUp: false,
+      capped: true,
+    };
+  }
+  const newTier = oldTier + 1;
+  const gear = rebuildGearAtTier(rng, old, newTier);
+  const nextGear = [...state.gear];
+  nextGear[index] = gear;
+
+  return {
+    state: {
+      ...state,
+      gear: nextGear,
+      tierCharms: (state.tierCharms ?? 0) - 1,
+      log: [`【升阶符】${old.name} 升阶为 ${gear.name}（${gear.rarityName ?? gear.rarity}）。`, ...state.log].slice(0, 50),
+    },
+    gear,
+    tierUp: true,
+    capped: false,
+  };
+}
+
+/**
+ * 给账号添加一张兑换码道具券（key 如 'backbone-recruit'）。
+ */
+export function addRedeemTicket(
+  state: SurvivalGameState,
+  ticketId: string,
+  qty: number,
+): SurvivalGameState {
+  const tickets = { ...(state.redeemTickets ?? {}) };
+  tickets[ticketId] = (tickets[ticketId] ?? 0) + Math.max(0, qty);
+  return { ...state, redeemTickets: tickets };
+}
+
+/**
+ * 使用「战团骨干招募券」：生成一名段位3 幸存者。
+ * 战团有空位直接入队，否则进入待招募列表；不消耗入队名额外的资源。
+ */
+export function useBackboneRecruitTicket(
+  state: SurvivalGameState,
+  rng: RNG,
+  now: number = Date.now(),
+): { state: SurvivalGameState; npc: SurvivorProfile | null; joined: boolean; full: boolean } {
+  const qty = state.redeemTickets?.['backbone-recruit'] ?? 0;
+  if (qty <= 0) return { state, npc: null, joined: false, full: false };
+  // 战团已满：不消耗本券，提示先遣散
+  if (state.survivors.length >= WARBAND_CAP) {
+    return { state, npc: null, joined: false, full: true };
+  }
+  const tickets = { ...(state.redeemTickets ?? {}), 'backbone-recruit': qty - 1 };
+  const npc = generateSurvivor(rng, { genTier: 3 });
+  const withTicket = { ...state, redeemTickets: tickets };
+  const next = addSummonedSurvivor(withTicket, npc, now);
+  return { state: next, npc, joined: true, full: false };
+}
+
 // ===== 医疗道具制作（道具制作） =====
 
 export interface MedCraftRecipe {
@@ -1231,6 +1378,7 @@ export function acceptRecruit(
     survivorStatus: status,
     recruits: state.recruits.filter((r) => r.id !== recruitId),
     activeSurvivorId: state.activeSurvivorId ?? recruited.id,
+    totalRecruits: (state.totalRecruits ?? 1) + 1,
     log: [`【招募】${npc.name}（${npc.tierName}）入伙，付费 ${fee} 废土币。`, ...state.log].slice(0, 50),
   };
 }

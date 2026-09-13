@@ -95,6 +95,13 @@ export function loadGame(): SurvivalGameState | null {
           return { ...g, name: buildGearName(tier, slot), rarity: newRarity, rarityName: newRarity };
         });
       }
+      // v1.1.10：累计招募数/兑换券库存迁移（旧存档缺省时按当前战团人数回退）
+      if (typeof data.totalRecruits !== 'number') {
+        data.totalRecruits = Math.max(1, Array.isArray(data.survivors) ? data.survivors.length : 1);
+      }
+      if (!data.redeemTickets || typeof data.redeemTickets !== 'object') {
+        data.redeemTickets = {};
+      }
       return data;
     }
   } catch {
